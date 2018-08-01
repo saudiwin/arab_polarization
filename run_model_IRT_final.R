@@ -131,7 +131,7 @@ ggplot(lookat,aes(y=sum_count,x=time_three)) + geom_path() + theme_minimal() + f
                               coup_day_new,
                               times$time_three[times$time==yday('2013-11-08')]),
                      labels=c('2013-03-31','2013-07-02','2013-11-08')) +
-  geom_vline(aes(xintercept=32),linetype=3)
+  geom_vline(aes(xintercept=coup_day_new),linetype=3)
 
 ggsave('retweets_counts.png')
 
