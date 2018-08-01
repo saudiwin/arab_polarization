@@ -1,4 +1,4 @@
-# Repository for Data and Code for "When Groups Fall Apart: A Study of Transnational Polarization with Twitter from the Arab Uprisings"
+# Repository for Data and Code for "When Groups Fall Apart: Measuring Transnational Polarization with Twitter from the Arab Uprisings"
 
 ## by Robert Kubinec and John Owen
 
