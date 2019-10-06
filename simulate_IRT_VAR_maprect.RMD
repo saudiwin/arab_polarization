@@ -1,0 +1,635 @@
+---
+title: "A Simulation of the IRT-VAR model with parallel processing"
+author: "Robert Kubinec"
+date: "October 4, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyr)
+require(ggplot2)
+require(dplyr)
+require(forcats)
+require(rstan)
+require(stringr)
+require(shinystan)
+require(bayesplot)
+
+source('helper_func.R')
+```
+
+## Model Definition
+
+The item response theory-vector autoregression (IRT-VAR) is an extension of IRT-based ideal point models that allows for ideal points to influence each other over time. This is accomplished by using the principles of Bayesian vector auto-regression in which lags of one set of ideal points are included in the priors for others' ideal points. This extension permits the estimation of impulse-response functions (IRFs) and other useful quantities for measuring how latent traits are affecting each other over time.
+
+In this document, I simulate this model from first principles. For a full definition of the model, I refer you to the accompanying paper.
+
+This version of the model is an extension that allows for within-chain parallelization with MCMC Stan.
+
+## Setup
+
+These are parameters that control various factors in the simulation:
+
+```{r params}
+
+# for parallel processing = number of cores available
+
+Sys.setenv(STAN_NUM_THREADS = 10)
+
+# Number of sides
+
+sides <- 4
+
+# Number of elites per side 
+
+elites <- 12
+
+# Number of time points
+
+t <- 20
+
+# Number of citizens
+
+cit <- 50
+```
+
+## Simulation
+
+We first draw all the ground truth citizen points/item parameters from normal distributions:
+
+```{r ideal_pts}
+# Intercepts points
+cit_pt <- rnorm(n=cit)
+# Discrim points
+cit_dis1 <- rnorm(n=cit)
+cit_dis2 <- rnorm(n=cit)
+# Diff points
+cit_diff <- rnorm(n=cit)
+# separate points for hurdle/missing data model
+abs_cit_pt <- rnorm(n=cit)
+abs_cit_dis1 <- rnorm(n=cit)
+abs_cit_dis2 <- rnorm(n=cit)
+```
+
+We also draw ancillary parameters:
+```{r other_params}
+init_sides1 <- rnorm(sides/2)
+init_sides2 <- rnorm(sides/2)
+cuts <- c(-1,1)
+betax1 <- rnorm(sides,0,.25)
+betax2 <- rnorm(sides,0,.25)
+#intercepts
+alpha_int1 <- c(-1,1,rnorm(2,0,0.25))
+alpha_int2 <- c(1,-1,rnorm(2,0,0.25))
+# to generate adjustment parameters, we draw from the unit circle
+unit_pts <- pracma::randp(n=sides)
+adj_in1 <- runif(sides,min = -0.5,max=0.5)
+adj_out1 <- runif(sides,min = -0.5,max=0.5)
+adj_in2 <- runif(sides,min = -0.5,max=0.5)
+adj_out2 <- runif(sides,min = -0.5,max=0.5)
+alpha1 <- rnorm(sides)
+alpha2 <- rnorm(sides)
+sigma1 <- c(.1,rnorm(sides-1,0.1,0.02))
+sigma2 <- c(.1,rnorm(sides-1,0.1,0.02))
+country <- .5
+```
+
+We then loop over the number of time points to generate the ideal points of the elites as a function of the prior values of each:
+
+```{r loop_gen}
+
+# first set of elites
+
+  out_vec1 <- gen_ts_data(t=t,
+                          adj_in=adj_in1[1:2],
+                          adj_out=adj_out1[1:2],
+                          alpha_int=alpha_int1[1:2],
+                          this_beta=betax1[1:2],
+                          sigma=sigma1[1:2],
+                          init_sides=init_sides1,
+                          country=country)
+
+  out_vec1 %>% 
+    mutate(time=1:t) %>% 
+    gather(series,estimates,-time) %>% 
+    ggplot(aes(y=estimates,x=time,linetype=series)) +geom_path() +theme_minimal() +
+    geom_vline(xintercept=(t/2),linetype=4)
+
+# simulate second set of elites
+  
+   out_vec2 <- gen_ts_data(t=t,
+                          adj_in=adj_in1[3:4],
+                          adj_out=adj_out1[3:4],
+                          alpha_int=alpha_int1[3:4],
+                          this_beta=betax1[3:4],
+                          sigma=sigma1[3:4],
+                          init_sides=init_sides2,
+                          country=country)
+
+  out_vec2 %>% 
+    mutate(time=1:t) %>% 
+    gather(series,estimates,-time) %>% 
+    ggplot(aes(y=estimates,x=time,linetype=series)) +geom_path() +theme_minimal() +
+    geom_vline(xintercept=(t/2),linetype=4)
+  
+  # now generate second dimension
+  
+    out_vec3 <- gen_ts_data(t=t,
+                          adj_in=adj_in2[1:2],
+                          adj_out=adj_out2[1:2],
+                          alpha_int=alpha_int2[1:2],
+                          this_beta=betax2[1:2],
+                          sigma=sigma2[1:2],
+                          init_sides=rnorm(sides/2),
+                          country=0)
+  
+   out_vec4 <- gen_ts_data(t=t,
+                          adj_in=adj_in2[3:4],
+                          adj_out=adj_out2[3:4],
+                          alpha_int=alpha_int2[3:4],
+                          this_beta=betax2[3:4],
+                          sigma=sigma2[3:4],
+                          init_sides=rnorm(sides/2),
+                          country=0)
+
+combine_vec1 <- bind_cols(out_vec1,out_vec2) %>% as.matrix
+combine_vec2 <- bind_cols(out_vec3,out_vec4) %>% as.matrix
+
+```
+
+We can plot these simulated auto-regressive ideal point lines over each other:
+
+```{r sim_plot}
+combine_plot <- combine_vec1 %>% as_data_frame %>% 
+  mutate(time=1:t) %>% 
+  gather(series,estimates,-time) %>% 
+  mutate(series=factor(series),
+         series=fct_recode(series,`Tunisia Islamists`='t_11',
+                           `Egypt Islamists`='t_12',
+                           `Tunisia Secularists`='t_111',
+                           `Egypt Secularists`='t_121'))
+  combine_plot %>% ggplot(aes(y=estimates,x=time,linetype=series,colour=series)) +
+    geom_path(size=1) +
+    theme_minimal() +
+  geom_vline(xintercept=(t/2),linetype=4) +
+  scale_colour_brewer(palette='Paired',name='') +
+    scale_linetype(name='') +
+  theme(panel.grid = element_blank(),
+        legend.position = 'bottom') + 
+    xlab('Time') +
+    ylab('Ideal Points')
+  
+  ggsave(filename='ecm_example.png')
+
+```
+
+Based on these time-varying ideal points, we can then simulate the outcome as a standardized Normal distribution of tweets by taking the difference between these ideal points and the citizen/item parameter scores.
+
+I also include a separate first stage of the model that acts as a selection mechanism in which people only decide to retweet an elite if they select into seeing that elite's tweet.
+
+```{r calc_outcome}
+# create ID variables for each elite & citizen
+elite_ids <- rep(1:sides,times=cit)
+cit_ids <- rep(1:cit,each=sides)
+
+all_ids <- lapply(1:t,function(i) {
+  data_frame(elite_ids,cit_ids)
+})
+names(all_ids) <- as.character(1:t)
+all_ids <- bind_rows(all_ids,
+                     .id='time_ids') %>% 
+  mutate(time_ids=as.integer(time_ids))
+combine_ids <- as.matrix(all_ids)
+
+elite_ids <- all_ids$elite_ids
+cit_ids <- all_ids$cit_ids
+time_ids <- all_ids$time_ids
+country_id <- as.integer(combine_ids[,2] %in% c(2,4))
+# first generate probability of actually seeing the tweet
+
+present <- sapply(1:nrow(combine_ids), function(n) {
+  runif(1)<plogis(abs_cit_dis1[cit_ids[n]] * (combine_vec1[time_ids[n],elite_ids[n]]) +
+                    abs_cit_dis2[cit_ids[n]] * combine_vec2[time_ids[n],elite_ids[n]] -
+                    abs_cit_pt[cit_ids[n]])
+})
+
+# loop over and produce tweet count
+
+gen_out <- sapply(1:nrow(combine_ids), function(n) {
+  if(present[n]) {
+  outcome <- rpois(n=1,lambda = exp(cit_dis1[cit_ids[n]]*(combine_vec1[time_ids[n],elite_ids[n]]) +
+                                      cit_dis2[cit_ids[n]]*combine_vec2[time_ids[n],elite_ids[n]] -
+                                                  cit_diff[cit_ids[n]])) 
+  return(outcome)
+  } else {
+    return(99999)
+  }
+  })
+
+# replace NAs with double max value
+
+# create version of the data suitable for map-reduce with Stan (maprect function)
+
+all_data <- cbind(gen_out,country_id,combine_ids,combine_ids[,2]) %>% 
+  as_tibble %>% 
+  rename(coding_numd1="elite_ids",
+         coding_numd2="V6") %>% 
+  arrange(cit_ids,desc(gen_out)) %>% 
+  gather(key = "variable",value="index",-cit_ids)
+
+all_data_split <- all_data %>% 
+  split(f=all_data$cit_ids) %>% 
+  lapply(function(d) d$index)
+
+
+
+all_data_array <- abind::abind(all_data_split,along=2)
+
+missingd <- apply(all_data_array,2,function(col) sum(col[1:(length(gen_out)/cit)]==99999))
+
+# create matrix of IDs to pass along with data
+
+all_data_array <- rbind(matrix(c(missingd,
+                                 rep(sides,ncol(all_data_array)),
+                                 rep(t,ncol(all_data_array)),
+                                 rep(t/2,ncol(all_data_array))),ncol=ncol(all_data_array),byrow = T),
+                        all_data_array)
+
+```
+
+Given this outcome, we can now fit the model in Stan.
+
+```{r fit_model}
+
+code_compile <- stan_model(file='irt_var_maprect_nonvarying_2d_v5.stan')
+
+# need to create time variable for gamma
+
+time_gamma <- c(rep(0L,(t/2)-1),rep(1L,t/2))
+
+#function to create starting values
+
+start_func <- function() {
+  list(alpha=runif(t*sides,min = -0.5,max=0.5),
+       gamma1=c(0.5,0.5),
+       gamma2=c(0.5,0.5),
+       sigma_time1=rep(0.1,sides-1),
+       sigma_time2=rep(0.1,sides-1),
+       adj_in1=c(-0.25,0.25,-0.25,0.25),
+       adj_out1=c(0.25,-0.25,0.25,-0.25),
+       adj_in2=c(-0.25,0.25,-0.25,0.25),
+       adj_out2=c(0.25,-0.25,-0.25,0.25),
+       alpha_int1=c(-1,1,0,0),
+       alpha_int2=c(1,-1,0,0),
+       mean_delta=1,
+       mean_beta=0,
+       sigma_beta=1,
+       sigma_delta=1,
+       beta_0=rnorm(n=cit),
+       delta_10=rnorm(n=cit),
+       delta_11=rnorm(n=cit),
+       delta_20=rnorm(n=cit),
+       delta_21=rnorm(n=cit))
+}
+
+time_counter <- as.matrix(1:t,ncol=1)
+
+out_fit <- sampling(code_compile,
+                    data=list(J=sides,
+                              nshards=cit,
+                              K=cit,
+                              `T`=t,
+                              C=5,
+                              N=dim(all_data_array)[1],
+                              S=dim(all_data_array)[2],
+                              alldata=t(all_data_array),
+                              id_num_high=1,
+                              id_num_low=1,
+                              time_points=as.matrix(1:cit),
+                    coup=as.integer(t/2),
+                    start_vals=c(init_sides1,init_sides2),
+                    time_gamma=time_gamma),
+                      cores=1,
+                    control=list(max_treedepth=15),
+                    init=start_func,
+                    chains=4,
+                    seed=6651)
+saveRDS(list(model=out_fit,true=list(alpha=c(combine_vec1,combine_vec2),betax=c(betax1,betax2))),'data/out_fit_simulation_maprect_nonvarying_v5.rds')
+```
+
+We first do an $\hat{R}$ check to make sure the model converged. Some of the Rhats are higher than 1.1, but further analysis reveals that some of the parameters took longer to converge but are still in the right location, as is evidenced by the plots below.
+
+```{r rhats}
+stan_rhat(out_fit)
+```
+
+The model is only weakly-identified in some parameters because of the complexity of the hyperparameters using a dataset of this size. Nonetheless, on average the model is still correct in returning the ideal point parameters, as the following plot shows:
+
+```{r plot_ideal_pts1}
+
+ideal_pts <- as.data.frame(out_fit,pars='alpha1_m') %>% 
+  mutate(iter=1:n()) %>% 
+  gather(key='param',value='estimate',-iter) %>% 
+  group_by(param) %>% 
+  summarize(high_est=quantile(estimate,.1),
+            low_est=quantile(estimate,.9),
+            med_est=quantile(estimate,0.5))
+
+param_names <- str_extract_all(unique(ideal_pts$param),pattern='[0-9]+')
+
+time_pts <- sapply(param_names,function(x) as.numeric(x[3]))
+ideal_code <- sapply(param_names,function(x) as.numeric(x[2]))
+			
+ideal_pts <- mutate(ideal_pts,
+                    time_pt=time_pts,
+                    ideal_pt=ideal_code,
+                    ideal_pt=factor(ideal_pt,labels=c('Tunisia Islamists',
+                                                      'Egypt Islamists',
+                                                      'Tunisia Secularists',
+                                                      'Egypt Secularists')))
+to_join <- as_data_frame(combine_vec1) %>% 
+  mutate(time_pt=1:n()) %>% 
+  gather(key='ideal_pt',value='true_estimate',-time_pt) %>% 
+  mutate(ideal_pt=factor(ideal_pt,levels=c('t_11','t_12','t_111','t_121'),
+                         labels=c('Tunisia Islamists',
+                                                      'Egypt Islamists',
+                                                      'Tunisia Secularists',
+                                                      'Egypt Secularists')))
+
+to_plot <- left_join(ideal_pts,
+                     to_join,
+                     by=c('ideal_pt',
+                          'time_pt')) %>% 
+  group_by(ideal_pt) %>% 
+  mutate(med_est=med_est*(sd(true_estimate)/sd(med_est)) ,
+         high_est=high_est*(sd(true_estimate)/sd(high_est)),
+         low_est=low_est*(sd(true_estimate)/sd(low_est)),
+         betax=as.numeric(time_pt<50)) %>% 
+  group_by(ideal_pt,betax) %>% 
+  mutate(cond_mean=mean(med_est))
+
+to_plot %>% 
+  ggplot(aes(y=true_estimate,x=time_pt)) +
+  geom_ribbon(aes(ymin=high_est,
+                  ymax=low_est,
+                  group=ideal_pt),
+              alpha=0.5) +
+   geom_line(aes(colour=ideal_pt),size=.7) +
+  geom_line(aes(y=cond_mean),linetype=2) +
+  scale_color_brewer(name='',type='div') +
+  facet_wrap(~ideal_pt,scales = 'free') +
+  theme(panel.grid=element_blank(),
+        text=element_text(size=12),
+        panel.background = element_blank(),
+        strip.background = element_blank(),
+        legend.background = element_blank(),
+        legend.position='bottom') +
+  geom_vline(xintercept=50,linetype=3,alpha=0.5) +
+  xlab('Days') +
+  ylab('Ideal Points')
+
+ggsave('sim_recover1.png',height = 5,width=8,units='in')
+```
+
+```{r plot_ideal_pts2}
+
+ideal_pts <- as.data.frame(out_fit,pars='alpha2_m') %>% 
+  mutate(iter=1:n()) %>% 
+  gather(key='param',value='estimate',-iter) %>% 
+  group_by(param) %>% 
+  summarize(high_est=quantile(estimate,.1),
+            low_est=quantile(estimate,.9),
+            med_est=quantile(estimate,0.5))
+
+param_names <- str_extract_all(unique(ideal_pts$param),pattern='[0-9]+')
+
+time_pts <- sapply(param_names,function(x) as.numeric(x[3]))
+ideal_code <- sapply(param_names,function(x) as.numeric(x[2]))
+			
+ideal_pts <- mutate(ideal_pts,
+                    time_pt=time_pts,
+                    ideal_pt=ideal_code,
+                    ideal_pt=factor(ideal_pt,labels=c('Tunisia Islamists',
+                                                      'Egypt Islamists',
+                                                      'Tunisia Secularists',
+                                                      'Egypt Secularists')))
+to_join <- as_data_frame(combine_vec2) %>% 
+  mutate(time_pt=1:n()) %>% 
+  gather(key='ideal_pt',value='true_estimate',-time_pt) %>% 
+  mutate(ideal_pt=factor(ideal_pt,levels=c('t_11','t_12','t_111','t_121'),
+                         labels=c('Tunisia Islamists',
+                                                      'Egypt Islamists',
+                                                      'Tunisia Secularists',
+                                                      'Egypt Secularists')))
+
+to_plot <- left_join(ideal_pts,
+                     to_join,
+                     by=c('ideal_pt',
+                          'time_pt')) %>% 
+  group_by(ideal_pt) %>% 
+  mutate(med_est=med_est*(sd(true_estimate)/sd(med_est)) ,
+         high_est=high_est*(sd(true_estimate)/sd(high_est)),
+         low_est=low_est*(sd(true_estimate)/sd(low_est)),
+         betax=as.numeric(time_pt<50)) %>% 
+  group_by(ideal_pt,betax) %>% 
+  mutate(cond_mean=mean(med_est))
+
+to_plot %>% 
+  ggplot(aes(y=true_estimate,x=time_pt)) +
+  geom_ribbon(aes(ymin=high_est,
+                  ymax=low_est,
+                  group=ideal_pt),
+              alpha=0.5) +
+   geom_line(aes(colour=ideal_pt),size=.7) +
+  geom_line(aes(y=cond_mean),linetype=2) +
+  scale_color_brewer(name='',type='div') +
+  facet_wrap(~ideal_pt,scales = 'free') +
+  theme(panel.grid=element_blank(),
+        text=element_text(size=12),
+        panel.background = element_blank(),
+        strip.background = element_blank(),
+        legend.background = element_blank(),
+        legend.position='bottom') +
+  geom_vline(xintercept=50,linetype=3,alpha=0.5) +
+  xlab('Days') +
+  ylab('Ideal Points')
+
+ggsave('sim_recover2.png',height = 5,width=8,units='in')
+```
+
+
+Now to compare the coefficients in the VAR we will also estimate a VAR using a standard R package on the simulated (true) ideal points.
+
+```{r calc_true_var1}
+to_ts <- ts(combine_vec1,start=1,end=nrow(combine_vec1),class=c("mts", "ts", "matrix"))
+betax_m <- as.matrix(c(rep(0,t/2),rep(1,t/2)))
+colnames(betax_m) <- 'betax'
+model_out <- vars::VAR(to_ts,p=1,type='const',exogen=betax_m)
+coefs <- coef(model_out)
+est_betax <- sapply(coefs,function(x) x['betax',1])
+est_alpha_int <- sapply(coefs,function(x) x['const',1])
+
+``` 
+
+Now we can calculate impulse-response functions (IRFs) and compare those to the "true" IRFs I estimated using the `vars` package. We calculate the IRF of each time series on every other time series pre-coup and post-coup. 
+
+```{r calc_irfs1}
+
+ints_est <- as.matrix(out_fit,pars='alpha_int1')
+betax_est <- as.matrix(out_fit,pars='betax1')
+adj_out_est <- as.matrix(out_fit,pars='adj_out1')
+adj_in_est <- as.matrix(out_fit,pars='adj_in1')
+#country_est <- as.matrix(out_fit,pars='country')
+
+
+
+all_irfs1 <- bind_rows(list(`Islamists\nEgypt`=irf(adj_in=adj_in_est[,1:2],
+                                             adj_out=adj_out_est[,1:2]),
+                      `Islamists\nTunisia`=irf(adj_in=adj_in_est[,c(2,1)],
+                                             adj_out=adj_out_est[,c(2,1)]),
+                      `Secularists\nEgypt`=irf(adj_in=adj_in_est[,3:4],
+                                             adj_out=adj_out_est[,3:4]),
+                      `Secularists\nTunisia`=irf(adj_in=adj_in_est[,c(4,3)],
+                                             adj_out=adj_out_est[,c(4,3)])),
+                      .id='Series') %>% 
+  group_by(Series,time) %>% 
+  summarize(median_est=median(y_shock),
+            upper=quantile(y_shock,.95),
+            lower=quantile(y_shock,.05)) %>% 
+  mutate(type='Estimated')
+
+
+# Now let's make "real" IRFS
+
+egypt_isl_true <- vars::irf(model_out,impulse='t_12',response='t_11',ortho=F,runs=500)
+tunisia_isl_true <- vars::irf(model_out,impulse='t_11',response='t_12',ortho=F,runs=500)
+egypt_sec_true <- vars::irf(model_out,impulse='t_121',response='t_111',ortho=F,runs=500)
+tunisia_sec_true <- vars::irf(model_out,impulse='t_111',response='t_121',ortho=F,runs=500)
+
+all_irfs2 <- bind_rows(list(`Islamists\nEgypt`=data_frame(median_est=egypt_isl_true$irf$t_12[-1,1],
+                                                          upper=egypt_isl_true$Upper$t_12[-1,1],
+                                                          lower=egypt_isl_true$Lower$t_12[-1,1],
+                                                          time=1:10),
+                      `Islamists\nTunisia`=data_frame(median_est=tunisia_isl_true$irf$t_11[-1,1],
+                                                          upper=tunisia_isl_true$Upper$t_11[-1,1],
+                                                          lower=tunisia_isl_true$Lower$t_11[-1,1],
+                                                          time=1:10),
+                      `Secularists\nEgypt`=data_frame(median_est=egypt_sec_true$irf$t_121[-1,1],
+                                                          upper=egypt_sec_true$Upper$t_121[-1,1],
+                                                          lower=egypt_sec_true$Lower$t_121[-1,1],
+                                                          time=1:10),
+                      `Secularists\nTunisia`=data_frame(median_est=tunisia_sec_true$irf$t_111[-1,1],
+                                                          upper=tunisia_sec_true$Upper$t_111[-1,1],
+                                                          lower=tunisia_sec_true$Lower$t_111[-1,1],
+                                                          time=1:10)),
+                      .id='Series') %>% 
+  mutate(type='True')
+
+combine_irf <- bind_rows(all_irfs1,all_irfs2)
+
+combine_irf %>% 
+  ggplot(aes(y=median_est,x=time))   +
+  geom_ribbon(aes(ymin=lower,ymax=upper,fill=type),alpha=0.4) +
+  geom_line(aes(linetype=type,colour=type),size=.9) +
+  theme(panel.grid=element_blank(),
+        panel.background = element_blank()) + xlab('Days Since Shock') + 
+  ylab('ChangeIdeological Positions') + 
+  scale_fill_brewer(palette='Paired',name='') + 
+  scale_colour_brewer(type = 'div',name='') +
+  facet_wrap(~Series,scales='free_y') +
+  scale_linetype(name='') +
+  geom_hline(yintercept = 0,linetype=2)
+
+ggsave('irf_simulation_panels1.png')
+
+
+```
+
+Now to compare the coefficients in the VAR we will also estimate a VAR using a standard R package on the simulated (true) ideal points.
+
+```{r calc_true_var2}
+to_ts <- ts(combine_vec1,start=1,end=nrow(combine_vec1),class=c("mts", "ts", "matrix"))
+betax_m <- as.matrix(c(rep(0,t/2),rep(1,t/2)))
+colnames(betax_m) <- 'betax'
+model_out <- vars::VAR(to_ts,p=1,type='const',exogen=betax_m)
+coefs <- coef(model_out)
+est_betax <- sapply(coefs,function(x) x['betax',1])
+est_alpha_int <- sapply(coefs,function(x) x['const',1])
+
+``` 
+
+Now we can calculate impulse-response functions (IRFs) and compare those to the "true" IRFs I estimated using the `vars` package. We calculate the IRF of each time series on every other time series pre-coup and post-coup. 
+
+```{r calc_irfs2}
+
+ints_est <- as.matrix(out_fit,pars='alpha_int2')
+betax_est <- as.matrix(out_fit,pars='betax2')
+adj_out_est <- as.matrix(out_fit,pars='adj_out2')
+adj_in_est <- as.matrix(out_fit,pars='adj_in2')
+
+
+
+all_irfs1 <- bind_rows(list(`Islamists\nEgypt`=irf(adj_in=adj_in_est[,1:2],
+                                             adj_out=adj_out_est[,1:2]),
+                      `Islamists\nTunisia`=irf(adj_in=adj_in_est[,c(2,1)],
+                                             adj_out=adj_out_est[,c(2,1)]),
+                      `Secularists\nEgypt`=irf(adj_in=adj_in_est[,3:4],
+                                             adj_out=adj_out_est[,3:4]),
+                      `Secularists\nTunisia`=irf(adj_in=adj_in_est[,c(4,3)],
+                                             adj_out=adj_out_est[,c(4,3)])),
+                      .id='Series') %>% 
+  group_by(Series,time) %>% 
+  summarize(median_est=median(y_shock),
+            upper=quantile(y_shock,.95),
+            lower=quantile(y_shock,.05)) %>% 
+  mutate(type='Estimated')
+
+
+# Now let's make "real" IRFS
+
+egypt_isl_true <- vars::irf(model_out,impulse='t_12',response='t_11',ortho=F,runs=500)
+tunisia_isl_true <- vars::irf(model_out,impulse='t_11',response='t_12',ortho=F,runs=500)
+egypt_sec_true <- vars::irf(model_out,impulse='t_121',response='t_111',ortho=F,runs=500)
+tunisia_sec_true <- vars::irf(model_out,impulse='t_111',response='t_121',ortho=F,runs=500)
+
+all_irfs2 <- bind_rows(list(`Islamists\nEgypt`=data_frame(median_est=egypt_isl_true$irf$t_12[-1,1],
+                                                          upper=egypt_isl_true$Upper$t_12[-1,1],
+                                                          lower=egypt_isl_true$Lower$t_12[-1,1],
+                                                          time=1:10),
+                      `Islamists\nTunisia`=data_frame(median_est=tunisia_isl_true$irf$t_11[-1,1],
+                                                          upper=tunisia_isl_true$Upper$t_11[-1,1],
+                                                          lower=tunisia_isl_true$Lower$t_11[-1,1],
+                                                          time=1:10),
+                      `Secularists\nEgypt`=data_frame(median_est=egypt_sec_true$irf$t_121[-1,1],
+                                                          upper=egypt_sec_true$Upper$t_121[-1,1],
+                                                          lower=egypt_sec_true$Lower$t_121[-1,1],
+                                                          time=1:10),
+                      `Secularists\nTunisia`=data_frame(median_est=tunisia_sec_true$irf$t_111[-1,1],
+                                                          upper=tunisia_sec_true$Upper$t_111[-1,1],
+                                                          lower=tunisia_sec_true$Lower$t_111[-1,1],
+                                                          time=1:10)),
+                      .id='Series') %>% 
+  mutate(type='True')
+
+combine_irf <- bind_rows(all_irfs1,all_irfs2)
+
+combine_irf %>% 
+  ggplot(aes(y=median_est,x=time))   +
+  geom_ribbon(aes(ymin=lower,ymax=upper,fill=type),alpha=0.4) +
+  geom_line(aes(linetype=type,colour=type),size=.9) +
+  theme(panel.grid=element_blank(),
+        panel.background = element_blank()) + xlab('Days Since Shock') + 
+  ylab('Change in Ideological Positions') + 
+  scale_fill_brewer(palette='Paired',name='') + 
+  scale_colour_brewer(type = 'div',name='') +
+  facet_wrap(~Series,scales='free_y') +
+  scale_linetype(name='') +
+  geom_hline(yintercept = 0,linetype=2)
+
+ggsave('irf_simulation_panels2.png')
+
+
+```
+
+
