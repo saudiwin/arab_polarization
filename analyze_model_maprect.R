@@ -1,4 +1,9 @@
-# analyze model fitted by cmdstan on NYU-ABU DHABI cluster
+# analyze model fitted by cmdstan 
+# Robert Kubinec 7/29/2020
+# This file reproduces the plots in the paper
+# Identifying Transnational Polarization
+
+# requires fitted model objects in the data/ folder
 
 require(dplyr)
 require(tidyr)
@@ -13,15 +18,24 @@ require(tidybayes)
 
 # load and combine fitted posteriors
 
-fit_mod1 <- rstan::read_stan_csv("data/arab_full_1.csv")
-fit_mod2 <- rstan::read_stan_csv("data/arab_full_2.csv")
-fit_mod3 <- rstan::read_stan_csv("data/arab_full_3.csv")
-#fit_mod4 <- rstan::read_stan_csv("data/arab_full_4.csv")
-fit_mod5 <- rstan::read_stan_csv("data/arab_full_5.csv")
-combine_fit <- rstan::sflist2stanfit(list(fit_mod1,
-                                          fit_mod2,
-                                          fit_mod3,
-                                          fit_mod5))
+  # train model for reviewer 3 (only part of data used)
+  
+  train_fit <- rstan::read_stan_csv("data/arab_full_.csv")
+  
+  # actual models fit in paper 
+  
+  fit_mod1 <- rstan::read_stan_csv("data/arab_full_1.csv")
+  fit_mod2 <- rstan::read_stan_csv("data/arab_full_2.csv")
+  fit_mod3 <- rstan::read_stan_csv("data/arab_full_3.csv")
+  # this model is not used because it did not converge (high divergences)
+  #fit_mod4 <- rstan::read_stan_csv("data/arab_full_4.csv")
+  fit_mod5 <- rstan::read_stan_csv("data/arab_full_5.csv")
+  combine_fit <- rstan::sflist2stanfit(list(fit_mod1,
+                                            fit_mod2,
+                                            fit_mod3,
+                                            fit_mod5))
+
+
 
 # need the original indices
 
@@ -108,7 +122,8 @@ d1 %>%
     geom_vline(aes(xintercept=as.numeric(as.Date('2013-07-03'))),linetype=3) +
   geom_vline(aes(xintercept=as.numeric(as.Date('2013-07-25'))),linetype=3) +
   theme(panel.background = element_blank(),
-        panel.grid = element_blank()) + 
+        panel.grid = element_blank(),
+        legend.position = "bottom") + 
   xlab("") +
   ylab("Islamist-Secular Axis") +
   annotate('text',x=as.Date(c('2013-07-03','2013-07-25')),
@@ -117,7 +132,7 @@ d1 %>%
            size=3,
            fontface="bold")
 
-ggsave("d1_plot.png")
+ggsave("d1_plot.png",scale=0.85)
  
 d2 <- time_series %>% 
   mutate(Dimension=if_else(jj<5,"Religion","Democracy")) %>% 
@@ -134,24 +149,25 @@ d2 %>%
   ggplot(aes(y=Median_Democracy,x=time_date)) +
   geom_ribbon(aes(ymin=Low_Democracy,
                   ymax=High_Democracy,
-                  fill=paste(Identity,Country)),
+                  fill=paste(Identity,Country,sep = "\n")),
               alpha=0.5) +
   scale_fill_brewer(type="qual",name="") +
-  scale_y_continuous(breaks=c(1,0.5,0,
-                              -0.5,-1,-1.5),
+  scale_y_continuous(breaks=c(.9,0.5,0,
+                              -0.5,-1,-1.4),
                      labels=c("Anti-\nDemocratic",
                               "0.5",
                               "0.0",
                               "-0.5",
                               "-1",
                               "Pro-\nDemocratic")) +
-  geom_line(aes(linetype=paste(Identity,Country)),
+  geom_line(aes(linetype=paste(Identity,Country,sep = "\n")),
             alpha=0.8) +
   scale_linetype(name="") +
   geom_vline(aes(xintercept=as.numeric(as.Date('2013-07-03'))),linetype=3) +
   geom_vline(aes(xintercept=as.numeric(as.Date('2013-07-25'))),linetype=3) +
   theme(panel.background = element_blank(),
-        panel.grid = element_blank()) + 
+        panel.grid = element_blank(),
+        legend.position = "bottom") + 
   xlab("") +
   ylab("Democracy Axis") +
   annotate('text',x=as.Date(c('2013-07-03','2013-07-25')),
@@ -160,7 +176,7 @@ d2 %>%
            size=3,
            fontface="bold")
 
-ggsave("d2_plot.png")
+ggsave("d2_plot.png",scale=.8)
 
 # need original IDs to recombine D1 and D2
 
@@ -245,11 +261,20 @@ orig_ids %>%
 ggsave("2d_plot.png")
 
 # now need to calculate our ideal point marginal effects!!
+
+
+  sigmas_train <- as.data.frame(train_fit,"varparams") %>% 
+    mutate(iter=1:n()) %>% 
+    gather(key = "variable",
+           value="value",-iter)
+
+  sigmas <- as.data.frame(combine_fit,"varparams") %>% 
+    mutate(iter=1:n()) %>% 
+    gather(key = "variable",
+           value="value",-iter)
+
   
-sigmas <- as.data.frame(combine_fit,"varparams") %>% 
-  mutate(iter=1:n()) %>% 
-  gather(key = "variable",
-        value="value",-iter)
+
 
 # need to separate indices and figure out what the parameters are
 
@@ -277,6 +302,30 @@ sigmas_d2_sum <- group_by(sigmas_d2,ind1) %>%
             high=quantile(value,0.95),
             low=quantile(value,0.05))
 
+sigmas_train <- mutate(sigmas_train,ind1=as.numeric(str_extract(variable,"[0-9]+")),
+                 ind2=as.numeric(str_extract(variable,"(?<=,)[0-9]+"))) %>% 
+  mutate(ind2=factor(ind2,levels=c(1:6),
+                     labels=c("d1_obs_discrim",
+                              "d1_abs_discrim",
+                              "d2_obs_discrim",
+                              "d2_abs_discrim",
+                              "int_obs",
+                              "int_abs")))
+
+sigmas_d1_train <- filter(sigmas_train,ind2=="d1_obs_discrim")
+
+sigmas_d2_train <- filter(sigmas_train,ind2=="d2_obs_discrim")
+
+sigmas_d1_sum_train <- group_by(sigmas_d1,ind1) %>% 
+  summarize(med=median(value),
+            high=quantile(value,0.95),
+            low=quantile(value,0.05))
+
+sigmas_d2_sum_train <- group_by(sigmas_d2,ind1) %>% 
+  summarize(med=median(value),
+            high=quantile(value,0.95),
+            low=quantile(value,0.05))
+
 # need to get betas
 
 betax1 <- as.data.frame(combine_fit,"betax1") %>% 
@@ -293,6 +342,10 @@ betax1 <- as.data.frame(combine_fit,"betax1") %>%
                                   "Secularist Egypt",
                                   "Secularist Tunisia")))
 
+# if training, reduce number of iterations used
+
+  betax1_train <- filter(betax1, iter %in% sigmas_train$iter)
+
 # iterate over posterior draws and calculate effect conditional on pos/neg discrimination
 # for all params in to_plot
 
@@ -306,6 +359,7 @@ neg_eff_d1 <- purrr::map2(split(sigmas_d1,sigmas_d1$iter),
   
   cov <- mutate(cov,
                 type="Islamist Tweets",
+                train=FALSE,
                 marg_effect= sapply(value,function(v) exp(mean(v*neg_discrim))))
   return(cov)
 }) %>% bind_rows
@@ -320,6 +374,7 @@ pos_eff_d1 <- purrr::map2(split(sigmas_d1,sigmas_d1$iter),
                             
                             cov <- mutate(cov,
                                           type="Secularist Tweets",
+                                          train=FALSE,
                                           marg_effect= sapply(value,function(v) exp(mean(v*pos_discrim))))
                             return(cov)
                           }) %>% bind_rows
@@ -337,10 +392,64 @@ bind_rows(neg_eff_d1,
         panel.background = element_blank(),
         strip.background = element_blank(),
         strip.text = element_text(face="bold"),
-        axis.ticks.y=element_blank()) +
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_text(size=7)) +
+  coord_flip()
+ggsave("marg_d1.png",height=2.5,width=4.5,units='in',scale=1.5)
+
+
+neg_eff_d1_train <- purrr::map2(split(sigmas_d1_train,sigmas_d1_train$iter),
+                          split(betax1_train,betax1_train$iter),
+                          function(dis,cov) {
+                            
+                            neg_discrim <- dis$value[dis$value<0]
+                            
+                            #calculate marginal changes in probability
+                            
+                            cov <- mutate(cov,
+                                          type="Islamist Tweets",
+                                          train=TRUE,
+                                          marg_effect= sapply(value,function(v) exp(mean(v*neg_discrim))))
+                            return(cov)
+                          }) %>% bind_rows
+
+pos_eff_d1_train <- purrr::map2(split(sigmas_d1_train,sigmas_d1_train$iter),
+                          split(betax1_train,betax1_train$iter),
+                          function(dis,cov) {
+                            
+                            pos_discrim <- dis$value[dis$value>0]
+                            
+                            #calculate marginal changes in probability
+                            
+                            cov <- mutate(cov,
+                                          type="Secularist Tweets",
+                                          train=TRUE,
+                                          marg_effect= sapply(value,function(v) exp(mean(v*pos_discrim))))
+                            return(cov)
+                          }) %>% bind_rows
+
+bind_rows(neg_eff_d1,
+          pos_eff_d1,
+          neg_eff_d1_train,
+          pos_eff_d1_train) %>% 
+  ggplot(aes(y=marg_effect-1,x=variable)) +
+  stat_summary(fun.data = "median_hilow",aes(colour=train),position=position_dodge(width=.5)) +
+  facet_wrap(~type) +
+  scale_y_continuous(labels=scales::percent) +
+  ylab("Marginal Percentage Change\nin Average Tweet Counts Due to Coup") +
+  xlab("") +
+  geom_hline(yintercept=0,linetype=2) +
+  theme(panel.grid=element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_text(face="bold"),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_text(size=7)) +
   coord_flip()
 
-ggsave("marg_d1.png")
+
+
+ggsave("marg_d1_train.png",height=2.5,width=4.5,units='in',scale=1.5)
 
 # now D2 marginal effects
 
@@ -358,7 +467,9 @@ betax2 <- as.data.frame(combine_fit,"betax2") %>%
                                   "Democratic Egypt",
                                   "Democratic Tunisia")))
 
-
+if(train) {
+  betax2 <- filter(betax2, iter %in% sigmas$iter)
+}
 
 
 neg_eff_d2 <- purrr::map2(split(sigmas_d2,sigmas_d2$iter),
@@ -405,7 +516,13 @@ bind_rows(neg_eff_d2,
         axis.ticks.y=element_blank()) +
   coord_flip()
 
-ggsave("marg_d2.png")
+
+if(train) {
+  ggsave("marg_d2_train.png",height=2.5,width=4.5,units='in',scale=1.5)
+} else {
+  ggsave("marg_d2.png",height=2.5,width=4.5,units='in',scale=1.5)
+}
+
 
 # Now we need to do the IRFs, and then all done!!
 

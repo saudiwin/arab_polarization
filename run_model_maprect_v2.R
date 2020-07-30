@@ -1,6 +1,7 @@
 # This script loads anonymized Twitter data & codings of elite Twitter users
-# And then fits the IRT-VAR model described in Kubinec and Owen (2018)
-# Note that fitting the full IRT-VAR model will take approximately 1 day & require 16 GB memory
+# And then fits the IRT-VAR model described in Kubinec and Owen (2020)
+# data is exported to data to be used on a cluster with 
+# cmdstan (command-line interface to Stan)
 
 
 require(dplyr)
@@ -13,6 +14,21 @@ require(readr)
 require(forcats)
 require(googledrive)
 require(lubridate)
+require(patchwork)
+
+# create training set
+# in response to reviewer 3
+# see appendix
+
+train <- F
+
+# whether to save data for running mpi on cluster
+# you can try to run it on your desktop, but could take forever
+# setting this to true will export the data for use with cmdstan (stan code + data)
+# otherwise you can try feeding the data/init values directly to rstan and sample
+# locally
+
+mpi <- T
 
 # time to aggregate twitter dates to
 
@@ -36,9 +52,9 @@ elite_codings_dem <- read_csv("data/2d_coding.csv") %>%
             by=c(param_name="Username")) %>% 
   group_by(Country) %>% 
   mutate(codingd2=if_else(med_est>median(med_est),paste0("Democratic_",Country),
-                        paste0("Anti-Democratic_",Country))) %>% 
+                          paste0("Anti-Democratic_",Country))) %>% 
   ungroup %>% 
-         mutate(coding_numd2=as.numeric(factor(codingd2))) %>% 
+  mutate(coding_numd2=as.numeric(factor(codingd2))) %>% 
   filter(!is.na(Country))
 
 # write out codings for paper
@@ -56,6 +72,8 @@ select(elite_codings_sect,Username,`Secularist/Islamist`=coding) %>%
         tabular.environment='longtable')
 
 #SQLite databases
+# contain aggregated retweet counts by user
+
 all_tunis <- dbConnect(SQLite(),'data/tunis_tweets.sqlite')
 all_egypt <- dbConnect(SQLite(),'data/egypt_tweets_small.sqlite')
 
@@ -66,31 +84,38 @@ egypt_rts <- dbReadTable(all_egypt,'unique_rts')
 
 filter_tunis <- group_by(tunis_rts,rt_ids,username) %>% count %>% group_by(rt_ids) %>% count()
 
-filter_tunis %>% ggplot(aes(x=n)) +
+out_p2 <- filter_tunis %>% ggplot(aes(x=n)) +
   geom_histogram() +
   theme_minimal() +
   theme(panel.grid=element_blank()) +
+  annotate("text",x=20,y=7000,label=paste0("Mean Count of Retweeted Elites: ", round(mean(filter_tunis$n),3))) +
   xlab('Number of Unique Retweeted Elites') +
-  ylab('Count of Citizen Users') +
+  ylab('Count of Users') +
+  ggtitle("Tunisia") + 
   geom_vline(aes(xintercept=mean(n)),
-                 size=1,colour='red',
+             size=1,colour='red',
              linetype=3)
-ggsave('tunis_users_RTS.png')
 
 # same for egypt
 
 filter_egypt <- group_by(egypt_rts,rt_ids,username) %>% count %>% group_by(rt_ids) %>% count()
 
-filter_egypt %>% ggplot(aes(x=n)) +
-  geom_histogram() +
+out_p1 <- filter_egypt %>% ggplot(aes(x=n)) +
+  geom_histogram(bins=30) +
+  #geom_density(alpha=0.5,fill="blue",colour=NA) +
   theme_minimal() +
   theme(panel.grid=element_blank()) +
+  ggtitle("Egypt") +
   xlab('Number of Unique Retweeted Elites') +
-  ylab('Count of Citizen Users') +
+  ylab('Count of Users') +
+  annotate("text",x=25,y=80000,label=paste0("Mean Count of Retweeted Elites: ", round(mean(filter_egypt$n),3))) +
   geom_vline(aes(xintercept=mean(n)),
              size=1,colour='red',
              linetype=3)
-ggsave('egypt_users_RTS.png')
+
+out_p1 / out_p2 + plot_annotation(tag_levels="A")
+
+ggsave("user_compare.png")
 
 combined_data <- bind_rows(filter(egypt_rts,rt_ids %in% filter_egypt$rt_ids),
                            filter(tunis_rts,rt_ids %in% filter_tunis$rt_ids)) %>% 
@@ -115,7 +140,7 @@ times <- data_frame(time=old_days,time_three=new_days,
                     coup=if_else(time_three>coup_day_new,2L,1L),
                     coup_day=coup_day) %>% 
   mutate(time_date=as.Date(time,origin='2012-12-31'))
-saveRDS(times,'times.rds')
+saveRDS(times,'data/times.rds')
 
 combined_data <- left_join(combined_data,
                            times)
@@ -125,21 +150,22 @@ times <- distinct(times,time_three,time, coup)
 combined_data_small <- left_join(combined_data,
                                  elite_codings_sect,
                                  by=c('username'='Username')) %>% 
-                      left_join(select(elite_codings_dem,codingd2,coding_numd2,
-                                       param_name),
-                                by=c("username"="param_name")) %>% 
-                                   group_by(time_three,
-                                coding_numd1,
-                                coding_numd2,
-                                rt_ids,coup) %>% tally
+  left_join(select(elite_codings_dem,codingd2,coding_numd2,
+                   param_name),
+            by=c("username"="param_name")) %>% 
+  group_by(time_three,
+           coding_numd1,
+           coding_numd2,
+           rt_ids,coup) %>% tally
+
 
 # we want to drop all users that don't RT multiple groups over time 
 # at least once
 
 keep_rts_d1 <- distinct(ungroup(combined_data_small),
-                       coding_numd1,
-                       n,
-                       rt_ids) %>% 
+                        coding_numd1,
+                        n,
+                        rt_ids) %>% 
   group_by(rt_ids) %>% 
   summarize(n_rts=sum(n),
             n_dist=length(unique(coding_numd1)),
@@ -165,6 +191,11 @@ combine_lists <- full_join(select(keep_rts_d1,rt_ids),
 
 combined_data_small <- left_join(combine_lists,combined_data_small)
 
+if(train) {
+  combined_data_small <- filter(combined_data_small,coup==1)
+}
+
+
 # drop missing
 
 combined_data_small_nomis <- filter(combined_data_small,!is.na(coding_numd1),
@@ -180,9 +211,9 @@ combined_data_small_nomis <- filter(combined_data_small,!is.na(coding_numd1),
 
 lookat <- group_by(combined_data_small_nomis,time_three,coding_numd1) %>% summarize(sum_count=sum(n)) %>% 
   mutate(Series=recode(as.character(coding_numd1),`1`='Islamist Egypt',
-                           `2`='Islamist Tunisia',
-                           `3`='Secularist Egypt',
-                           `4`='Secularist Tunisia'))
+                       `2`='Islamist Tunisia',
+                       `3`='Secularist Egypt',
+                       `4`='Secularist Tunisia'))
 
 ggplot(lookat,aes(y=sum_count,x=time_three)) + geom_path() + theme_minimal() + facet_wrap(~Series,scales='free_y') +
   ylab('') + xlab('') +
@@ -197,9 +228,9 @@ ggsave('retweets_counts.png')
 # types of retweets over time 
 
 lookat_c_ret <- group_by(combined_data_small_nomis,time_three,coding_numd1) %>% summarize(onet=sum(n==1),
-                                                                                        twot=sum(n==2),
-                                                                                        threet=sum(n==3),
-                                                                                        fourt=sum(n==4))
+                                                                                          twot=sum(n==2),
+                                                                                          threet=sum(n==3),
+                                                                                          fourt=sum(n==4))
 
 lookat_cit_ratio <- group_by(combined_data_small_nomis,rt_ids,coding_numd1) %>% tally %>% 
   group_by(rt_ids) %>% 
@@ -221,18 +252,12 @@ combined_data_small_nomis  <- ungroup(combined_data_small_nomis) %>%
 
 combined_zero <- select(combined_data_small_nomis,time_three,coding_numd1,
                         coding_numd2,coup,n,cit_ids) %>% 
-                        complete(cit_ids,nesting(coding_numd1,
-                                 coding_numd2),time_three,fill=list(n=99999)) %>% 
+  complete(cit_ids,nesting(coding_numd1,
+                           coding_numd2),time_three,fill=list(n=99999)) %>% 
   mutate(coup=if_else(time_three>coup_day_new,2L,1L),
          coding_numd1=as.numeric(factor(coding_numd1)),
          coding_numd2=as.numeric(factor(coding_numd2)))
 
-# now collapse missing and non-missing
-
-# combined_zero <- group_by(combined_zero,coding_numd1,
-#                           coding_numd2,time_three) %>% 
-#   mutate(num_miss=sum(n==99999),
-#          num_obs=n() - num_miss)
 
 if(sample_users==T) {
   # filter list of retweet users for users with lots of retweets across sectarian groups
@@ -278,51 +303,57 @@ all_data_array <- rbind(matrix(c(missingd,
 
 all_data_array <- apply(all_data_array,2,as.integer)
 
-out_data <- list(J=max(combined_zero$coding_numd1),
-K=max(combined_zero$cit_ids),
-`T`=max(combined_zero$time_three),
-C=6,
-N=dim(all_data_array)[1],
-S=dim(all_data_array)[2],
-alldata=t(all_data_array),
-coup=50L,
-id_num_high=1,
-id_num_low=1,
-time_points=as.matrix(1:max(combined_zero$cit_ids)),
-start_vals=rep(c(-.5,-.5,.5,.5),2),
-time_gamma=distinct(times,time_three,coup) %>% slice(-n()) %>% pull(coup))
+time_gamma <- distinct(times,time_three,coup) 
 
-stan_rdump(ls(out_data),file="data/to_maprect_cluster.R",
-           envir = list2env(out_data))
+if(train) {
+  # only pre-coup observations
+  time_gamma <- filter(time_gamma,coup==1)
+}
+
+out_data <- list(J=max(combined_zero$coding_numd1),
+                 K=max(combined_zero$cit_ids),
+                 `T`=max(combined_zero$time_three),
+                 C=6,
+                 N=dim(all_data_array)[1],
+                 S=dim(all_data_array)[2],
+                 alldata=t(all_data_array),
+                 coup=50L,
+                 id_num_high=1,
+                 id_num_low=1,
+                 time_points=as.matrix(1:max(combined_zero$cit_ids)),
+                 start_vals=rep(c(-.5,-.5,.5,.5),2),
+                 time_gamma=time_gamma %>% slice(-n()) %>% pull(coup))
+
+# dumps data to .R file for cmdstan
+
+if(mpi) {
+  stan_rdump(ls(out_data),file="data/to_maprect_cluster.R",
+             envir = list2env(out_data))
+}
 
 # create initial starting values
 
 init_list <- list(varparams=array(rnorm(all_data_array[2]*6,0,0.25),
                                   dim=c(dim(all_data_array)[2],
-                                                  ncol=6)),
+                                        ncol=6)),
                   dparams_nonc=runif((2*out_data$J*out_data$T)-(2*out_data$J),min = -0.25,max=0.25),
                   sigma_time1=rep(0.1,3),
-     sigma_time2=rep(0.1,3),
-     adj_in1=rep(0,4),
-     adj_out1=rep(0,4),
-     adj_in2=rep(0,4),
-     adj_out2=rep(0,4),
-     alpha_int1=c(-1,1,0.5,-0.5),
-     alpha_int2=c(1,-1,-0.5,0.5),
-     betax1=runif(4,-0.5,0.5),
-     betax2=runif(4,-0.5,0.5))
+                  sigma_time2=rep(0.1,3),
+                  adj_in1=rep(0,4),
+                  adj_out1=rep(0,4),
+                  adj_in2=rep(0,4),
+                  adj_out2=rep(0,4),
+                  alpha_int1=c(-1,1,0.5,-0.5),
+                  alpha_int2=c(1,-1,-0.5,0.5),
+                  betax1=runif(4,-0.5,0.5),
+                  betax2=runif(4,-0.5,0.5))
 
-stan_rdump(ls(init_list),file="data/to_maprect_init.R",
-           envir = list2env(init_list))
+# dumps initialization values to second .R file for cmdstan
 
-# actually run the model 
+if(mpi) {
+  
+  stan_rdump(ls(init_list),file="data/to_maprect_init.R",
+             envir = list2env(init_list))
+}
 
-# Sys.setenv(STAN_NUM_THREADS = 4)
-# 
-# current_stan_mod <- stan_model(file="irt_var_maprect_nonvarying_2d_v3.stan")
-# 
-# test_stan <- sampling(current_stan_mod,
-#                       data=out_data,
-#                       chains=1,
-#                       cores=1,
-#                       iter=2000)
+
